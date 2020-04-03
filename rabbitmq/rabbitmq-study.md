@@ -36,7 +36,7 @@ MQ全称为`Message Queue`，消息队列是应用程序和应用程序之间的
 
      MQ相当于一个中介，生产方通过MQ与消费方交互，他将应用程序进行解耦。
 
-## 1.2、AMQP、JMS、Message Broken
+## 1.2、AMQP、JMS、Message Broker
 
 ### 1.2.1、Message Broker
 
@@ -3339,11 +3339,11 @@ public class RabbitmqBatchDemoApplicationTests {
 
 ## 7.6、rabbitmq_delayed_message_exchange插件方式
 
-`TTL`方式实现延迟队列功能，**在消息死亡时间比较灵活复杂的时候我们不可能声明很多死信队列去管理**，而且声明一个就要6个bean，**希望能够有种方式使其消息死亡异步化，到期即死即消费，不会被阻塞**，这里介绍使用插件的方式，不过需要rabbitmq要是3.6版本以上，也就是说，加入你的rabbitmq版本太老只能用TTL。
+`TTL`方式实现延迟队列功能，**在消息死亡时间比较灵活复杂的时候我们不可能声明很多死信队列去管理**，而且声明一个就要6个bean，**希望能够有种方式使其消息死亡异步化，到期即死即消费，不会被阻塞**，这里介绍使用插件的方式，不过需要rabbitmq要是`3.6`版本以上，也就是说，加入你的rabbitmq版本太老只能用TTL。
 
 ### 7.6.1、基于插件方式实现流程
 
-这里和TTL方式有个很大的不同就是**TTL存放消息在死信队列(delayqueue)里，而基于插件存放消息在延时交换机里(x-delayed-message exchange)**。
+这里和TTL方式有个很大的不同就是**TTL存放消息在死信队列(`delayqueue`)里，而基于插件存放消息在延时交换机里(x-delayed-message exchange)**。
 
 ![在这里插入图片描述](img/20190107205627454.png)
 
@@ -3377,13 +3377,1458 @@ public class RabbitmqBatchDemoApplicationTests {
 
 ![image-20200227225950534](img/image-20200227225950534.png)
 
+### 7.6.2、依赖、配置文件
+
+同上
+
+### 7.6.3、配置类
+
+```java
+/**
+ * 配置类;
+ * @author Jjcc
+ * @version 1.0.0
+ * @className RabbitConfig.java
+ * @createTime 2020年02月26日 13:42:00
+ */
+@Configuration
+public class RabbitConfig {
+
+    /**
+     * 延时队列交换机；注意交换机的类型为：CustomExchange。
+     * @title customExchange
+     * @author Jjcc
+     * @return org.springframework.amqp.core.CustomExchange
+     * @createTime 2020/3/15 14:40
+     */
+    @Bean
+    public CustomExchange customExchange() {
+        HashMap<String, Object> map = new HashMap<>(4);
+        map.put("x-delayed-type", "direct");
+        return new CustomExchange("delay_plugins_exchange", "x-delayed-message", true, false, map);
+    }
+
+    /**
+     * 队列
+     * @title queue
+     * @author Jjcc
+     * @return org.springframework.amqp.core.Queue
+     * @createTime 2020/3/15 14:46
+     */
+    @Bean
+    public Queue queue() {
+        return new Queue("test_queue_1", true, false, false);
+    }
+
+    /**
+     * 消息队列绑定延迟交换机
+     * @title binding
+     * @author Jjcc
+     * @param customExchange 延迟交换机
+     * @param queue 消息队列
+     * @return org.springframework.amqp.core.Binding
+     * @createTime 2020/3/15 14:46
+     */
+    @Bean
+    public Binding binding(CustomExchange customExchange, Queue queue) {
+        return BindingBuilder.bind(queue).to(customExchange).with("delay_key").noargs();
+    }
+
+}
+```
+
+- 这里要特别注意的是，使用的是`CustomExchange`,不是`DirectExchange`，另外`CustomExchange`的类型必须是`x-delayed-message`。
+
+### 7.6.4、生产者
+
+```java
+@Component
+@Log4j2
+public class RabbitProducer {
+
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    public RabbitProducer(RabbitTemplate rabbitTemplate) {
+        this.rabbitTemplate = rabbitTemplate;
+    }
+
+    private AtomicLong count = new AtomicLong();
+
+    /**
+     * 发送消息时，相比于前面的生产者，这里额外添加了一个 org.springframework.amqp.core.MessagePostProcessor 参数。
+     * MessagePostProcessor 是一个接口，提供一个 postProcessMessage()方法，可以通过该方法指定该条消息的存活时间。
+     * @title send
+     * @author Jjcc
+     * @param delay 消息过期时间
+     * @return void
+     * @createTime 2020/2/28 0028 17:36
+     */
+//    @Async
+    public void send(Integer delay, String para) {
+        String s = "Hello World!!!："  + para;
+        rabbitTemplate.convertAndSend("delay_plugins_exchange", "delay_key", s, (message) -> {
+
+            Optional<Integer> delayOpt = Optional.ofNullable(delay);
+
+            // 如果 delay 参数不为空，则设置消息的存活时间。
+            // 这里是通过 plugins 方式实现的延迟队列，需要调用 setHeader("x-delay", delay); 而不是 setExpiration(String.valueOf(delay));
+            delayOpt.ifPresent( c -> {
+                if (0 != c) {
+//                    message.getMessageProperties().setExpiration(String.valueOf(delay));
+                    message.getMessageProperties().setHeader("x-delay", delay);
+                }
+            });
+            return message;
+        });
+        log.info("消息发送完成！！！！！！！！！");
+    }
+}
+```
+
+- 注意在发送的时候，必须加上一个`header`，基于`TTL`方式时，是通过`#setExpiration()`；`header`的key为 `x-delay`。
+
+### 7.6.5、消费者
+
+```java
+@Component
+@Log4j2
+public class DelayRabbitConsumer {
+
+    @RabbitListener(queues = "test_queue_1")
+    public void deadReceiver(String message) {
+        log.info("[onMessage][【延迟消息消费端】线程编号:{} 消息内容：{}]", Thread.currentThread().getId(), message);
+    }
+}
+```
+
+### 7.6.6、测试
+
+```java
+@SpringBootTest(classes = RabbitmqBatchDemoApplication.class)
+@RunWith(SpringRunner.class)
+public class RabbitmqBatchDemoApplicationTests {
+
+    @Autowired
+    private RabbitProducer producer;
+
+    @Test
+    public void contextLoads() throws InterruptedException {
+       sendDelay(null, null);
+
+        new CountDownLatch(1).await();
+    }
+
+    @Test
+    public void contextLoadsB() throws InterruptedException {
+        sendDelay(10000, "延迟10秒");
+        sendDelay(5000, "延迟5秒");
+        new CountDownLatch(1).await();
+    }
 
 
+    public void sendDelay(Integer delay, String para) throws InterruptedException {
+        producer.send(delay, para);
+        System.out.println("消息发送完成！！！！！！！！！");
+
+    }
+
+}
+```
+
+运行 `#contextLoadsB()`方法，得到如下结果：
+
+```
+2020-03-15 15:08:46.930  INFO 9836 --- [           main] com.jjcc.batch.producer.RabbitProducer   : 消息发送完成！！！！！！！！！
+消息发送完成！！！！！！！！！
+2020-03-15 15:08:46.932  INFO 9836 --- [           main] com.jjcc.batch.producer.RabbitProducer   : 消息发送完成！！！！！！！！！
+消息发送完成！！！！！！！！！
+2020-03-15 15:08:56.952  INFO 9836 --- [ntContainer#0-1] c.j.batch.consumer.DelayRabbitConsumer   : [onMessage][【延迟消息消费端】线程编号:17 消息内容：Hello World!!!：延迟10秒]
+
+```
+
+同时这里没有出现基于`TTL`方式实现延迟队列所出现的消费等待现象。
+
+# 8、并发消费
+
+在上述的示例中，我们配置的每一个 Spring-AMQP `@RabbitListener` ，都是**串行**消费的。显然，这在监听的 Queue 每秒消息量比较大的时候，会导致消费不及时，导致消息积压的问题。
+
+虽然说，我们可以通过启动多个 JVM 进程，实现**多进程的并发消费**，从而加速消费的速度。但是问题是，否能够实现**多线程**的并发消费呢？答案是**有**。
+
+在 `@RabbitListener` 注解中，有 `concurrency` 属性，它可以指定并发消费的线程数。例如说，如果设置 `concurrency=4` 时，Spring-AMQP 就会为**该** `@RabbitListener` 创建 4 个线程，进行并发消费。
+
+- 首先，我们来创建一个 Queue 为 `"DEMO_09"` 。
+- 然后，我们创建一个 Demo9Consumer 类，并在其消费方法上，添加 `@RabbitListener(concurrency=2)` 注解。
+- 再然后，我们启动项目。Spring-AMQP 会根据 `@RabbitListener(concurrency=2)` 注解，**创建 2 个 `RabbitMQ Consumer` 。注意噢，是 2 个 `RabbitMQ Consumer` 呢！！！后续，每个 `RabbitMQ Consumer` 会被单独分配到一个线程中，进行拉取消息，消费消息**。
+
+## 8.1、Spring-AMQP 的两个 [ContainerType](https://github.com/spring-projects/spring-boot/blob/master/spring-boot-project/spring-boot-autoconfigure/src/main/java/org/springframework/boot/autoconfigure/amqp/RabbitProperties.java#L566-L579) 容器类型
+
+Spring-AMQP 的两个 [ContainerType](https://github.com/spring-projects/spring-boot/blob/master/spring-boot-project/spring-boot-autoconfigure/src/main/java/org/springframework/boot/autoconfigure/amqp/RabbitProperties.java#L566-L579) 容器类型，枚举如下：
+
+```java
+// RabbitProperties.java
+
+public enum ContainerType {
+
+	/**
+	 * Container where the RabbitMQ consumer dispatches messages to an invoker thread.
+	 */
+	SIMPLE,
+
+	/**
+	 * Container where the listener is invoked directly on the RabbitMQ consumer
+	 * thread.
+	 */
+	DIRECT
+
+}
+```
+
+1. 第一种类型，`SIMPLE` 对应 `SimpleMessageListenerContainer`消息监听器容器。它一共有两类线程：
+
+   - `Consumer`线程，负责从`RabbitMQ Broker`获取`Queue`中的消息，存储到内存中的 `BlockingQueue`阻塞队列中。
+   - `Listener`线程，负责从内存中的`BlackQueue`获取消息，进行逻辑消费。
+
+   **注意：**每一个 `Consumer`线程，对应一个`RabbitMQ Consumer`，对应一个 `Listener`线程。也就是说它们三者是一一对应的。
+
+2. 第二种类型，`DIRECT`对应 `DirectMessageListenerContainer`消息监听容器。它只有一类线程，即做 `SIMPLE` 的 Consumer 线程的工作，也做 `SIMPLE` 的 Listener 线程工作。
+
+   **注意：**因为只有**一类**线程，所以它要么正在获取消息，要么正在消费消息，也就是**串行**的。
+
+🔥 默认情况下，Spring-AMQP 选择使用第一种类型，即 `SIMPLE` 容器类型。
+
+## 8.2、代码示例
+
+### 8.2.1、配置文件
+
+```yml
+spring:
+  rabbitmq:
+    username: guest
+    password: guest
+    host: localhost
+    port: 5672
+    listener:
+      type: simple            # 选择的 ListenerContainer 的类型。默认为 simple 类型
+      simple:
+        # 全局设置
+        concurrency: 2        # 每个 @ListenerContainer 的并发消费的线程数
+        max-concurrency: 10   # 每个 @ListenerContainer 允许的并发消费的线程数
+```
+
+- `spring.rabbitmq.listener.type`：监听容器类型。
+- `spring.rabbitmq.listener.simple.concurrency`：并发消费的线程数。
+- `spring.rabbitmq.listener.simple.max-concurrency`：最大并发消费的线程数，超过会报错。
+
+**注意**，是 `spring.rabbitmq.listener.simple.max-concurrency` 配置，是**限制**每个 `@RabbitListener` 的**允许**配置的 `concurrency` 最大大小。如果超过，则会抛出 IllegalArgumentException 异常。
+
+### 8.2.2、配置类
+
+这里通过注解的方式创建的交换机、队列、绑定。
+
+### 8.2.3、生产者
+
+```java
+@Component
+@Log4j2
+public class RabbitProducer {
+
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    public RabbitProducer(RabbitTemplate rabbitTemplate) {
+        this.rabbitTemplate = rabbitTemplate;
+    }
+
+    private AtomicLong count = new AtomicLong();
+
+    /**
+     * @title send
+     * @author Jjcc
+     * @return void
+     * @createTime 2020/2/28 0028 17:36
+     */
+    public void send(String para) {
+        String s = "Hello World!!!："  + para;
+        rabbitTemplate.convertAndSend("exchange_concurrency", "concurrency.key", s);
+        log.info("消息发送完成！！！！！！！！！");
+    }
+}
+```
+
+### 8.2.4、消费者
+
+```java
+@Component
+@Log4j2
+public class RabbitConsumer {
+
+    /**
+     * 普通消费端
+     * @title receiver
+     * @author Jjcc
+     * @param message 消息。
+     * @return void
+     * @createTime 2020/2/26 0026 15:08
+     */
+    @RabbitListener(bindings = {
+            @QueueBinding(value = @Queue(value = "queue_concurrency", durable = "true", autoDelete = "false", exclusive = "false")
+            , exchange = @Exchange(name = "exchange_concurrency", type = ExchangeTypes.TOPIC)
+            , key = "concurrency.key")}, concurrency = "2")
+    public void receiver(String message) throws InterruptedException {
+        log.info("[消息接收者：{}][消息主题：{}]", Thread.currentThread().getId(), message);
+
+        Thread.sleep(1000);
+
+    }
+}
+```
+
+可以通过 `@RabbitListener` 注解，设置并发数。优先级最高，可覆盖配置文件中的 `spring.rabbitmq.listener.simple.concurrency` 配置项。
+
+### 8.2.5、测试
+
+```java
+@SpringBootTest(classes = RabbitmqBatchDemoApplication.class)
+@RunWith(SpringRunner.class)
+public class RabbitmqBatchDemoApplicationTests {
+
+    @Autowired
+    private RabbitProducer producer;
 
 
+    @Test
+    public void contextLoadsB() throws InterruptedException {
+        for (int i = 0; i < 10; i++) {
+            sendDelay("消息：" + i);
+        }
+        System.out.println("消息发送完成！！！！！！！！！");
+        new CountDownLatch(1).await();
+    }
 
 
+    public void sendDelay(String para) {
+        producer.send(para);
 
+    }
+
+}
+```
+
+执行单元测试方法，控制台输出如下：
+
+```
+# 线程编号为 17
+2019-12-15 10:48:20.013  INFO 2937 --- [ntContainer#0-1] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:17 消息内容：Demo09Message{id=1576118899}]
+2019-12-15 10:48:20.015  INFO 2937 --- [ntContainer#0-1] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:17 消息内容：Demo09Message{id=1576118899}]
+2019-12-15 10:48:20.016  INFO 2937 --- [ntContainer#0-1] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:17 消息内容：Demo09Message{id=1576118899}]
+2019-12-15 10:48:20.017  INFO 2937 --- [ntContainer#0-1] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:17 消息内容：Demo09Message{id=1576118899}]
+2019-12-15 10:48:20.017  INFO 2937 --- [ntContainer#0-1] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:17 消息内容：Demo09Message{id=1576118899}]
+
+# 线程编号 18
+2019-12-15 10:48:20.013  INFO 2937 --- [ntContainer#0-2] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:18 消息内容：Demo09Message{id=1576118899}]
+2019-12-15 10:48:20.015  INFO 2937 --- [ntContainer#0-2] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:18 消息内容：Demo09Message{id=1576118899}]
+2019-12-15 10:48:20.016  INFO 2937 --- [ntContainer#0-2] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:18 消息内容：Demo09Message{id=1576118899}]
+2019-12-15 10:48:20.016  INFO 2937 --- [ntContainer#0-2] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:18 消息内容：Demo09Message{id=1576118899}]
+2019-12-15 10:48:20.017  INFO 2937 --- [ntContainer#0-2] c.i.s.l.r.consumer.Demo09Consumer        : [onMessage][线程编号:18 消息内容：Demo09Message{id=1576118899}]
+
+```
+
+可以看到，两个线程在消费 `"queue_concurrency"` 下的消息。
+
+# 9、消费者的消息确认
+
+在 RabbitMQ 中，Consumer 有两种消息确认的方式：
+
+- 方式一，自动确认。
+- 方式二，手动确认。
+
+对于**自动确认**的方式，RabbitMQ Broker 只要将消息写入到 TCP Socket 中成功，就认为该消息投递成功，而无需 `Consumer` **手动确认**。
+
+对于**手动确认**的方式，RabbitMQ Broker 将消息发送给 Consumer 之后，由 Consumer **手动确认**之后，才任务消息投递成功。
+
+实际场景下，因为自动确认存在可能**丢失消息**的情况，所以在对**可靠性**有要求的场景下，我们基本采用手动确认。当然，如果允许消息有一定的丢失，对**性能**有更高的产经下，我们可以考虑采用自动确认。
+
+## 9.1、投递标识符：投递标签（Tag）
+
+当消费者（订阅）注册后，RabbitMQ将使用`basic.deliver`方法投递（推送）消息。**这个方法携带一个投递标签，在每个通道上可以唯一的标识一次投递。因此投递标签的作用域是每个通道**。
+
+**投递标签是单调增长的正整数**，由客户端类库提供。应答投递的客户端类库方法也使用投递标签作为参数。
+
+## 9.2、ACK模式
+
+**为了保证消息从队列可靠地到达消费者，RabbitMQ提供消息确认机制(`message acknowledgment`)**。消费者在声明队列时，可以指定`noAck`参数，当`noAck=false`时，**RabbitMQ会等待消费者显式发回ack信号后才从内存(和磁盘，如果是持久化消息的话)中移去消息**。否则，RabbitMQ会在队列中消息被消费后立即删除它。
+
+**采用消息确认机制后**，只要令`noAck=false`，**消费者就有足够的时间处理消息**(任务)，不用担心处理消息过程中消费者进程挂掉后消息丢失的问题，因为RabbitMQ会一直持有消息直到消费者显式调用`basicAck`为止。
+
+当`noAck=false`时，对于RabbitMQ服务器端而言，队列中的消息分成了两部分：**一部分是等待投递给消费者的消息；一部分是已经投递给消费者，但是还没有收到消费者ack信号的消息**。如果**服务器端一直没有收到消费者的`ack`信号，并且消费此消息的消费者已经断开连接，则服务器端会安排该消息重新进入队列，等待投递给下一个消费者**（也可能还是原来的那个消费者）。
+
+> RabbitMQ不会为未ack的消息设置**超时时间**，它**判断此消息是否需要重新投递给消费者的唯一依据是消费该消息的消费者连接是否已经断开**。这么设计的原因是RabbitMQ允许消费者消费一条消息的时间可以很久很久。
+>
+
+在 Spring-AMQP 中，在 [AcknowledgeMode](https://github.com/spring-projects/spring-amqp/blob/master/spring-amqp/src/main/java/org/springframework/amqp/core/AcknowledgeMode.java) 中，定义了三种消息确认的方式：
+
+```java
+// AcknowledgeMode.java
+
+/**
+ * No acks - {@code autoAck=true} in {@code Channel.basicConsume()}.
+ */
+NONE, // 对应 Consumer 的自动确认
+
+/**
+ * Manual acks - user must ack/nack via a channel aware listener.
+ */
+MANUAL, // 对应 Consumer 的手动确认，由开发者在消费逻辑中，手动进行确认。
+
+/**
+ * Auto - the container will issue the ack/nack based on whether
+ * the listener returns normally, or throws an exception.
+ * <p><em>Do not confuse with RabbitMQ {@code autoAck} which is
+ * represented by {@link #NONE} here</em>.
+ */
+AUTO; // 对应 Consumer 的手动确认，在消费消息完成（包括正常返回、和抛出异常）后，由 Spring-AMQP 框架来“自动”进行确认。
+
+```
+
+- 实际上，就是将**手动确认**进一步细分，提供了由 Spring-AMQP 提供 Consumer 级别的自动确认。
+
+**在上述的示例中，我们都采用了 Spring-AMQP 默认的 `AUTO` 模式**。
+
+## 9.3、代码示例
+
+### 9.3.1、依赖
+
+前文一致
+
+### 9.3.2、配置文件
+
+```yml
+spring:
+  rabbitmq:
+    username: guest
+    password: guest
+    host: localhost
+    port: 5672
+    listener:
+      type: simple            # 选择的 ListenerContainer 的类型。默认为 simple 类型
+      simple:
+        acknowledge-mode: manual    # 配置 consumer 手动提交，目的是防止报错后未正确处理消息而丢失消息。
+```
+
+- `spring.rabbitmq.listener.simple.acknowledge-mode=true` 配置项，来配置 Consumer 手动提交。
+
+### 9.3.3、生产者
+
+```java
+@Component
+@Log4j2
+public class RabbitProducer {
+
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    public RabbitProducer(RabbitTemplate rabbitTemplate) {
+        this.rabbitTemplate = rabbitTemplate;
+    }
+
+    private AtomicLong count = new AtomicLong();
+
+    /**
+     * @title send
+     * @author Jjcc
+     * @return void
+     * @createTime 2020/2/28 0028 17:36
+     */
+    public void send(Integer id) {
+        rabbitTemplate.convertAndSend("exchange_concurrency", "concurrency.key", id);
+        log.info("消息发送完成！！！！！！！！！");
+    }
+}
+```
+
+### 9.3.4、消费者
+
+```java
+/**
+ * 消费端
+ * @author Jjcc
+ * @version 1.0.0
+ * @className RabbitConsumer.java
+ * @createTime 2020年02月26日 13:43:00
+ */
+@Component
+@Log4j2
+public class RabbitConsumer {
+
+
+    /**
+     * 默认情况下,如果没有配置手动ACK, 那么Spring Data AMQP 会在消息消费完毕后自动帮我们去ACK
+     * 存在问题：如果报错了,消息不会丢失,但是会无限循环消费,一直报错,如果开启了错误日志很容易就吧磁盘空间耗完
+     * @title ackReceiver
+     * @author Jjcc
+     * @param id 传递的参数
+     * @param channel 信道
+     * @param message 消息传递的参数
+     * @return void
+     * @createTime 2020/3/15 22:52
+     */
+    @RabbitListener(bindings = {
+            @QueueBinding(value = @Queue(value = "queue_concurrency", durable = "true", autoDelete = "false", exclusive = "false")
+                    , exchange = @Exchange(name = "exchange_concurrency", type = ExchangeTypes.TOPIC)
+                    , key = "concurrency.key")})
+    public void ackReceiver(Integer id, Channel channel, Message message) throws IOException {
+        int a;
+        if ((a = id % 2) == 1) {
+            System.out.println("id：" + id + "，余数：" + a);
+            // 通知 broker 消息已接收，可以 ACK(从队列中删除) 了
+            // 第二个参数 multiple ，用于批量确认消息，为了减少网络流量，手动确认可以被批处。
+            // 1. 当 multiple 为 true 时，则可以一次性确认 deliveryTag 小于等于传入值的所有消息
+            // 2. 当 multiple 为 false 时，则只确认当前 deliveryTag 对应的消息
+            channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+        }
+
+        try {
+            log.info("[消息接收者：{}][消息主题：{}]", Thread.currentThread().getId(), "消息id：" + id);
+        } catch (Exception e) {
+            e.printStackTrace();
+            /*
+             * basicRecover方法是进行补发操作；
+             * 参数为true，是把消息退回到queue，但是有可能被其它的consumer(集群)接收到。
+             * 参数为false，把消息退回到queue，只补发给当前的consumer。
+             */
+            channel.basicRecover(false);
+        }
+
+        /*
+         * basicReject方法是进行消息拒绝接收，不处理；
+         * 第一个参数，每个消息的唯一id
+         * 第二个参数为true，将消息放回到队列的末端。
+         * 第二个参数为false，将消息丢弃。
+         */
+//        channel.basicReject(message.getMessageProperties().getDeliveryTag(), false);
+
+        /*
+         * basicNack方法可以一次拒绝N条消息；
+         * 第一个参数，每个消息的唯一id。
+         * 第二个参数为true，将一次性拒绝所有小于等于deliveryTag的消息。
+         * 第二个参数为false，则只确认当前 deliveryTag 对应的消息。
+         * 第三个参数为true，将消息放回到队列的末端。
+         * 第三个参数为false，将消息直接丢弃。
+         */
+//        channel.basicNack(message.getMessageProperties().getDeliveryTag(), true, false);
+    }
+}
+```
+
+- 在消费方法上，我们增加类型为 [Channel](https://github.com/rabbitmq/rabbitmq-java-client/blob/master/src/main/java/com/rabbitmq/client/Channel.java) 的方法参数，和 `deliveryTag` 。通过调用其 `Channel#basicAck(deliveryTag, multiple)` 方法，可以进行消息的确认。
+- 在 `@RabbitListener` 注解的 `ackMode` 属性，我们可以设置自定义的 `AcknowledgeMode` 模式。
+- 除了 `#basicAck(deliverTag, multiple)`方法用于确认消息收到外。`#basicRecover(requeue)`用于路由不成功的消息可以使用`recovery`重新发送到队列中；`#basicReject(deliveryTag, requeue)`用于消息拒绝接受，不处理，可以设置消息是否放回到队列末端还是直接丢弃；`#basicNack(deliveryTag, multiple, requeue)`用于一次拒绝N条消息，客户端可以设置`basicNack`方法的`multiple`参数为`true`，将一次性拒绝所有小于等于`deliveryTag`的消息。
+- 在消费逻辑中，我们故意只提交消费的消息的 `Demo12Message.id` 为**奇数**的消息。😈 这样，我们只需要发送一条 `id=1` ，一条 `id=2` 的消息，如果第二条的消费进度没有被提交，就可以说明手动提交消费进度成功。
+
+### 9.3.5、测试
+
+```java
+// Demo12ProducerTest.java
+
+@RunWith(SpringRunner.class)
+@SpringBootTest(classes = Application.class)
+public class Demo12ProducerTest {
+
+    private Logger logger = LoggerFactory.getLogger(getClass());
+
+    @Autowired
+    private Demo12Producer producer;
+
+    @Test
+    public void testSyncSend() throws InterruptedException {
+        for (int id = 1; id <= 2; id++) {
+            producer.syncSend(id);
+            logger.info("[testSyncSend][发送编号：[{}] 发送成功]", id);
+        }
+
+        // 阻塞等待，保证消费
+        new CountDownLatch(1).await();
+    }
+
+}
+```
+
+执行 `#testSyncSend()` 单元测试，输出日志如下：
+
+```
+// Producer 同步发送 2 条消息成功
+2019-12-13 00:19:33.403  INFO 45869 --- [           main] c.i.s.l.r.producer.Demo12ProducerTest    : [testSyncSend][发送编号：[1] 发送成功]
+2019-12-13 00:19:33.406  INFO 45869 --- [           main] c.i.s.l.r.producer.Demo12ProducerTest    : [testSyncSend][发送编号：[2] 发送成功]
+
+// Demo08Consumer 消费 2 条消息成功
+2019-12-13 00:19:33.420  INFO 45869 --- [ntContainer#0-1] c.i.s.l.r.consumer.Demo12Consumer        : [onMessage][线程编号:17 消息内容：Demo12Message{id=1}]
+2019-12-13 00:19:33.421  INFO 45869 --- [ntContainer#0-1] c.i.s.l.r.consumer.Demo12Consumer        : [onMessage][线程编号:17 消息内容：Demo12Message{id=2}]
+```
+
+使用 RabbitMQ Management来查看 该消费者：
+
+![`"DEMO_12"` 的消费者列](.\img\02.png)
+
+- 有 1 条消息的未确认，符合预期~
+
+# 10、生产者的发送确认
+
+在 RabbitMQ 中，**默认**情况下，Producer 发送消息的方法，只保证将消息写入到 TCP Socket 中成功，并不保证消息发送到 RabbitMQ Broker 成功，并且持久化消息到磁盘成功。
+
+也就是说，我们上述的示例，Producer 在发送消息都不是绝对可靠，是存在丢失消息的可能性。
+
+## 10.1、Confirm 模式
+
+生产者将信道设置成`confirm`模式，一旦信道进入`confirm`模式，**所有在该信道上面发布的消息都会被指派一个唯一的ID(从1开始)**，一旦消息被投递到所有匹配的队列之后，**broker就会发送一个确认给生产者（包含消息的唯一ID）**,这就使得生产者知道消息已经正确到达目的队列了，**如果消息和队列是可持久化的，那么会将消息写入磁盘之后发出 确认接收**，broker回传给生产者的确认消息中`deliver-tag`域包含了确认消息的序列号，**此外broker也可以设置`basic.ack`的`multiple`域，表示到这个序列号之前的所有消息都已经得到了处理**。
+
+`confirm`模式最大的好处在于他是异步的，一旦发布一条消息，生产者应用程序就可以在等信道返回确认的同时继续发送下一条消息，当消息最终得到确认之后，生产者应用便可以通过回调方法来处理该确认消息，**如果RabbitMQ因为自身内部错误导致消息丢失，就会发送一条`nack`消息，生产者应用程序同样可以在回调方法中处理该`nack`消息**。
+
+> 在channel 被设置成 confirm 模式之后，所有被 publish 的后续消息都将被 confirm（即 ack） 或者被nack一次。但是没有对消息被 confirm 的快慢做任何保证，并且同一条消息不会既被 confirm又被nack 。**一个事务性的通道不能进入确认模式，一个确认模式的通道也不能成为事务性的**。
+
+## 10.2、实现原理
+
+在 RabbitMQ 中，Producer 采用 `Confirm` 模式，实现发送消息的确认机制，以保证消息发送的可靠性。实现原理如下：
+
+- 首先，Producer 通过调用 [`Channel#confirmSelect()`](https://github.com/rabbitmq/rabbitmq-java-client/blob/master/src/main/java/com/rabbitmq/client/Channel.java#L1278-L1283) 方法，将 Channel 设置为 `Confirm` 模式。
+- 然后，在该 Channel 发送的消息时，需要先通过 [`Channel#getNextPublishSeqNo()`](https://github.com/rabbitmq/rabbitmq-java-client/blob/master/src/main/java/com/rabbitmq/client/Channel.java#L1285-L1290) 方法，给发送的消息分配一个唯一的 ID 编号(`seqNo` 从 1 开始递增)，再发送该消息给 RabbitMQ Broker 。
+- 之后，RabbitMQ Broker 在接收到该消息，并被**路由到相应的队列之后**，会发送一个包含消息的唯一编号(`deliveryTag`)的确认给 Producer 。
+
+通过 `seqNo` 编号，将 Producer 发送消息的“请求”，和 RabbitMQ Broker 确认消息的“响应”串联在一起。
+
+> 通过这样的方式，Producer 就可以知道消息是否成功发送到 RabbitMQ Broker 之中，保证消息发送的可靠性。不过要注意，整个执行的过程实际是**异步**，需要我们调用 [`Channel#waitForConfirms()`](https://github.com/rabbitmq/rabbitmq-java-client/blob/master/src/main/java/com/rabbitmq/client/Channel.java#L1293-L1329) 方法，**同步**阻塞等待 RabbitMQ Broker 确认消息的“响应”。
+
+## 10.3、确认方式
+
+**Producer 采用 Confirm 模式时，有三种编程方式**：
+
+- 【同步】普通 Confirm 模式：Producer 每发送一条消息后，调用 `Channel#waitForConfirms()` 方法，等待服务器端 Confirm 。
+
+- 【同步】批量 Confirm 模式：Producer 每发送一批消息后，调用`Channel#waitForConfirms()` 方法，等待服务器端 Confirm 。
+
+  > 本质上，和「普通 Confirm 模式」是一样的。
+
+- 【异步】异步 Confirm 模式：Producer 提供一个回调方法，RabbitMQ Broker 在 Confirm 了一条或者多条消息后，Producer 会回调这个方法。
+
+```java
+// CachingConnectionFactory#ConfirmType.java
+
+public enum ConfirmType {
+
+	/**
+	 * Use {@code RabbitTemplate#waitForConfirms()} (or {@code waitForConfirmsOrDie()}
+	 * within scoped operations.
+	 */
+	SIMPLE, // 使用同步的 Confirm 模式
+
+	/**
+	 * Use with {@code CorrelationData} to correlate confirmations with sent
+	 * messsages.
+	 */
+	CORRELATED, // 使用异步的 Confirm 模式
+
+	/**
+	 * Publisher confirms are disabled (default).
+	 */
+	NONE // 不使用 Confirm 模式
+
+}
+```
+
+**在上述的示例中，我们都采用了 Spring-AMQP 默认的 `NONE` 模式**。
+
+## 10.4、同步 Confirm 模式
+
+注意，这里的**同步**，指的是我们通过调用 [`Channel#waitForConfirms()`](https://github.com/rabbitmq/rabbitmq-java-client/blob/master/src/main/java/com/rabbitmq/client/Channel.java#L1293-L1329) 方法，**同步**阻塞等待 RabbitMQ Broker 确认消息的“响应”。
+
+### 10.4.1、依赖
+
+前文一样。
+
+### 10.4.2、配置文件
+
+```yml
+spring:
+  rabbitmq:
+    username: guest
+    password: guest
+    host: localhost
+    port: 5672
+    listener:
+      type: simple            # 选择的 ListenerContainer 的类型。默认为 simple 类型
+      simple:
+        acknowledge-mode: manual    # 配置 consumer 手动提交，目的是防止报错后未正确处理消息而丢失消息。
+    publisher-confirm-type: simple  # 开启发送者的消息确认，simple：同步的confirm模式。
+```
+
+- `spring.rabbitmq.publisher-confirm-type=simple` 配置项，设置 `Confirm` 类型为 `ConfirmType.SIMPLE` 。
+
+### 10.4.3、生产者
+
+```java
+@Component
+@Log4j2
+public class RabbitProducer {
+
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    public RabbitProducer(RabbitTemplate rabbitTemplate) {
+        this.rabbitTemplate = rabbitTemplate;
+    }
+
+    /**
+     * 同步 Confirm 模式，消息的发送确认。
+     * @title send
+     * @author Jjcc
+     * @return void
+     * @createTime 2020/2/28 0028 17:36
+     */
+    public void send(Integer id) {
+
+        /*
+         * 参数一：OperationsCallback；自定义操作。
+         * 参数二：confirmCallback；定义接收到 RabbitMQ Broker 的成功“响应”时的回调。
+         * 参数三：confirmCallback；定义接收到 RabbitMQ Broker 的失败“响应”时的回调。
+         */
+        rabbitTemplate.invoke( (operations) -> {
+            // 同步发送消息
+            operations.convertAndSend("exchange_concurrency", "concurrency.key", id);
+            log.info("[doInRabbit][发送消息完成]");
+            // 等待确认；本质是使当前线程进入等待阻塞，直到回执唤醒
+            // timeout 参数为0，表示无限等待
+            operations.waitForConfirms(0);
+            log.info("[doInRabbit][等待 Confirm 完成]");
+            return null;
+        }, (deliveryTag, multiple) ->
+            // 消息发送成功
+            log.info("[handle][Confirm 成功]")
+        , (deliveryTag, multiple) ->
+            // 消息发送失败
+            log.info("[handle][Confirm 失败]")
+        );
+
+    }
+}
+```
+
+在 `RabbitTemplate` 提供的 API 方法中，如果 Producer 要使用同步的 Confirm 模式，需要调用 `#invoke(action, acks, nacks)` 方法。代码如下：
+
+```java
+// RabbitOperations.java
+// RabbitTemplate 实现了 RabbitOperations 接口
+
+/**
+ * Invoke operations on the same channel.
+ * If callbacks are needed, both callbacks must be supplied.
+ * @param action the callback.
+ * @param acks a confirm callback for acks.
+ * @param nacks a confirm callback for nacks.
+ * @param <T> the return type.
+ * @return the result of the action method.
+ * @since 2.1
+ */
+@Nullable
+<T> T invoke(OperationsCallback<T> action, @Nullable com.rabbitmq.client.ConfirmCallback acks,
+		@Nullable com.rabbitmq.client.ConfirmCallback nacks);
+```
+
+- 因为 Confirm 模式需要基于**相同** Channel ，所以我们需要使用该方法。
+
+- 在方法参数 `action` 中，我们可以自定义操作。
+
+- 在方法参数 `acks` 中，定义接收到 RabbitMQ Broker 的成功“响应”时的回调。
+
+- 在方法参数 `nacks` 中，定义接收到 RabbitMQ Broker 的失败“响应”时的回调。
+
+  > - 当消息最终得到确认之后，生产者应用便可以通过回调方法来处理该确认消息。
+  > - 如果 RabbitMQ 因为自身内部错误导致消息丢失，就会发送一条 nack 消息，生产者应用程序同样可以在回调方法中处理该 nack 消息。
+
+### 10.4.4、消费者
+
+```java
+@Component
+@Log4j2
+public class RabbitConsumer {
+
+
+    /**
+     * 默认情况下,如果没有配置手动ACK, 那么Spring Data AMQP 会在消息消费完毕后自动帮我们去ACK
+     * 存在问题：如果报错了,消息不会丢失,但是会无限循环消费,一直报错,如果开启了错误日志很容易就吧磁盘空间耗完
+     * @title ackReceiver
+     * @author Jjcc
+     * @param id 传递的参数
+     * @param channel 信道
+     * @param message 消息传递的参数
+     * @return void
+     * @createTime 2020/3/15 22:52
+     */
+    @RabbitListener(bindings = {
+            @QueueBinding(value = @Queue(value = "queue_concurrency", durable = "true", autoDelete = "false", exclusive = "false")
+                    , exchange = @Exchange(name = "exchange_concurrency", type = ExchangeTypes.TOPIC)
+                    , key = "concurrency.key")})
+    public void ackReceiver(Integer id, Channel channel, Message message) throws IOException {
+        // 通知 broker 消息已接收，可以 ACK(从队列中删除) 了
+        // 第二个参数 multiple ，用于批量确认消息，为了减少网络流量，手动确认可以被批处。
+        // 1. 当 multiple 为 true 时，则可以一次性确认 deliveryTag 小于等于传入值的所有消息
+        // 2. 当 multiple 为 false 时，则只确认当前 deliveryTag 对应的消息
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+
+        try {
+            log.info("[消息接收者：{}][消息主题：{}]", Thread.currentThread().getId(), "消息id：" + id);
+        } catch (Exception e) {
+            /*
+             * basicRecover方法是进行补发操作；
+             * 参数为true，是把消息退回到queue，但是有可能被其它的consumer(集群)接收到。
+             * 参数为false，把消息退回到queue，只补发给当前的consumer。
+             */
+            channel.basicRecover(false);
+
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+### 10.4.5、测试
+
+```java
+@SpringBootTest(classes = RabbitmqBatchDemoApplication.class)
+@RunWith(SpringRunner.class)
+public class RabbitmqBatchDemoApplicationTests {
+
+    @Autowired
+    private RabbitProducer producer;
+
+
+    @Test
+    public void contextLoadsB() throws InterruptedException {
+        for (int i = 0; i < 10; i++) {
+            sendDelay(i);
+        }
+        System.out.println("消息发送完成！！！！！！！！！");
+        new CountDownLatch(1).await();
+    }
+
+
+    public void sendDelay(Integer para) {
+        producer.send(para);
+
+    }
+
+}
+```
+
+执行方法，输出日志如下：
+
+```
+// 主线程，Producer 发送 1 条消息完成。
+2019-12-13 12:49:13.680  INFO 13247 --- [           main] c.i.s.l.r.producer.Demo13Producer        : [doInRabbit][发送消息完成]
+
+// AMQConnection 线程，Producer 确认收到 RabbitMQ Broker 对该消息的成功“响应” 。
+2019-12-13 12:49:13.689  INFO 13247 --- [ 127.0.0.1:5672] c.i.s.l.r.producer.Demo13Producer        : [handle][Confirm 成功]
+
+// 主线程，Producer 等待该消息的 Confirm 完成。
+2019-12-13 12:49:13.689  INFO 13247 --- [           main] c.i.s.l.r.producer.Demo13Producer        : [doInRabbit][等待 Confirm 完成]
+
+// 单元测试，打印下日志，可以忽略
+2019-12-13 12:49:13.694  INFO 13247 --- [           main] c.i.s.l.r.producer.Demo13ProducerTest    :
+[testSyncSend][发送编号：[1576212553] 发送成功]
+
+// 消费者的线程，Consumer 消费到该消息
+2019-12-13 12:49:13.699  INFO 13247 --- [ntContainer#0-1] c.i.s.l.r.consumer.Demo13Consumer        : [onMessage][线程编号:17 消息内容：Demo13Message{id=1576212553}]
+
+```
+
+## 10.5、异步 Confirm 模式
+
+### 10.5.1、依赖
+
+前文一样。
+
+### 10.5.2、配置文件
+
+```yml
+spring:
+  rabbitmq:
+    username: guest
+    password: guest
+    host: localhost
+    port: 5672
+    listener:
+      type: simple            # 选择的 ListenerContainer 的类型。默认为 simple 类型
+      simple:
+        acknowledge-mode: manual    # 配置 consumer 手动提交，目的是防止报错后未正确处理消息而丢失消息。
+    publisher-confirm-type: correlated  # 开启发送者的消息确认，correlated：异步的confirm模式。
+```
+
+- `spring.rabbitmq.publisher-confirm-type=correlated` 配置项，设置 Confirm 类型为 `ConfirmType.CORRELATED` 。
+
+在该类型下，Spring-AMQP 在创建完 RabbitMQ Channel 之后，也会**自动**调用 [`Channel#confirmSelect()`](https://github.com/rabbitmq/rabbitmq-java-client/blob/master/src/main/java/com/rabbitmq/client/Channel.java#L1278-L1283) 方法，将 Channel 设置为 Confirm 模式。
+
+### 10.5.3、Confirm 回执类
+
+创建一个类并实现 [RabbitTemplate.ConfirmCallback](https://github.com/spring-projects/spring-amqp/blob/master/spring-rabbit/src/main/java/org/springframework/amqp/rabbit/core/RabbitTemplate.java#L2712-L2727) 接口，提供 Producer 收到 RabbitMQ 确认消息的“响应”的回调。
+
+```java
+/**
+ * 异步的 confirm 的回执类
+ * @author Jjcc
+ * @version 1.0.0
+ * @className RabbitProducerConfirmCallback.java
+ * @createTime 2020年03月16日 22:05:00
+ */
+@Component
+@Log4j2
+public class RabbitProducerConfirmCallback implements RabbitTemplate.ConfirmCallback {
+
+    /**
+     * 把自己设置到 RabbitTemplate 中，作为 Confirm 的回调。
+     * @title RabbitProducerConfirmCallback
+     * @author Jjcc
+     * @param rabbitTemplate amqp提供的模板类
+     * @createTime 2020/3/16 22:10
+     */
+    public RabbitProducerConfirmCallback(RabbitTemplate rabbitTemplate) {
+        rabbitTemplate.setConfirmCallback(this);
+    }
+
+    @Override
+    public void confirm(CorrelationData correlationData, boolean ack, String cause) {
+        // ack 为 true，消息成功转发到 queue中；为 false，消息转发到 queue 失败
+        if (ack) {
+            log.info("[confirm][Confirm 成功 correlationData: {}]", correlationData);
+        } else {
+            log.error("[confirm][Confirm 失败 correlationData: {} cause: {}]", correlationData, cause);
+        }
+    }
+}
+```
+
+- 在构造方法中，把自己设置到 RabbitTemplate 中，作为 Confirm 的回调。
+- 在 `#confirm(...)` 方法中，根据是否 `ack` 成功，打印不同的日志。
+
+### 10.5.4、生产者
+
+```java
+@Component
+@Log4j2
+public class RabbitProducer {
+
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    public RabbitProducer(RabbitTemplate rabbitTemplate) {
+        this.rabbitTemplate = rabbitTemplate;
+    }
+
+    /**
+     * 异步 Confirm 模式，消息的发送确认不需要使用 invoke 方法
+     * 通过 rabbitTemplate 的 setConfirmCallback() 方法设置 confirm 的回执类实现
+     * @title send
+     * @author Jjcc
+     * @return void
+     * @createTime 2020/2/28 0028 17:36
+     */
+    public void send(Integer id) {
+
+        rabbitTemplate.convertAndSend("exchange_concurrency", "concurrency.key", id);
+
+    }
+}
+```
+
+不需要像同步的 `Confirm`一样，实现各种匿名对象，而是直接像我们其它示例一样，直接使用 RabbitTemplate 的 `#convertAndSend(...)` 等等方法即可。
+
+### 10.5.5、消费者
+
+```java
+@Component
+@Log4j2
+public class RabbitConsumer {
+
+
+    /**
+     * 默认情况下,如果没有配置手动ACK, 那么Spring Data AMQP 会在消息消费完毕后自动帮我们去ACK
+     * 存在问题：如果报错了,消息不会丢失,但是会无限循环消费,一直报错,如果开启了错误日志很容易就吧磁盘空间耗完
+     * @title ackReceiver
+     * @author Jjcc
+     * @param id 传递的参数
+     * @param channel 信道
+     * @param message 消息传递的参数
+     * @return void
+     * @createTime 2020/3/15 22:52
+     */
+    @RabbitListener(bindings = {
+            @QueueBinding(value = @Queue(value = "queue_concurrency", durable = "true", autoDelete = "false", exclusive = "false")
+                    , exchange = @Exchange(name = "exchange_concurrency", type = ExchangeTypes.TOPIC)
+                    , key = "concurrency.key")})
+    public void ackReceiver(Integer id, Channel channel, Message message) throws IOException {
+        // 通知 broker 消息已接收，可以 ACK(从队列中删除) 了
+        // 第二个参数 multiple ，用于批量确认消息，为了减少网络流量，手动确认可以被批处。
+        // 1. 当 multiple 为 true 时，则可以一次性确认 deliveryTag 小于等于传入值的所有消息
+        // 2. 当 multiple 为 false 时，则只确认当前 deliveryTag 对应的消息
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+
+        try {
+            log.info("[消息接收者：{}][消息主题：{}]", Thread.currentThread().getId(), "消息id：" + id);
+        } catch (Exception e) {
+            /*
+             * basicRecover方法是进行补发操作；
+             * 参数为true，是把消息退回到queue，但是有可能被其它的consumer(集群)接收到。
+             * 参数为false，把消息退回到queue，只补发给当前的consumer。
+             */
+            channel.basicRecover(false);
+
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+### 10.5.6、测试
+
+```java
+@SpringBootTest(classes = RabbitmqBatchDemoApplication.class)
+@RunWith(SpringRunner.class)
+public class RabbitmqBatchDemoApplicationTests {
+
+    @Autowired
+    private RabbitProducer producer;
+
+
+    @Test
+    public void contextLoadsB() throws InterruptedException {
+        for (int i = 0; i < 10; i++) {
+            sendDelay(i);
+        }
+        System.out.println("消息发送完成！！！！！！！！！");
+        new CountDownLatch(1).await();
+    }
+
+
+    public void sendDelay(Integer para) {
+        producer.send(para);
+
+    }
+
+}
+```
+
+执行方法，输出日志如下：
+
+```
+/ 单元测试，打印下日志，可以忽略
+2019-12-13 17:17:45.849  INFO 69003 --- [           main] c.i.s.l.r.producer.Demo13ProducerTest    :
+[testSyncSend][发送编号：[1576228665] 发送成功]
+
+// RabbitConnectionFactory 线程，Producer 确认收到 RabbitMQ Broker 对该消息的成功“响应” 。
+// 因为我们在 Demo13Producer 发送消息的时候，并未传入 CorrelationData 参数，所以为 null 。
+2019-12-13 17:17:45.859  INFO 69003 --- [nectionFactory1] .i.s.l.r.c.RabbitProducerConfirmCallback : [confirm][Confirm 成功 correlationData: null]
+
+// 消费者的线程，Consumer 消费到该消息
+2019-12-13 17:17:45.873  INFO 69003 --- [ntContainer#0-1] c.i.s.l.r.consumer.Demo13Consumer        : [onMessage][线程编号:17 消息内容：Demo13Message{id=1576228665}]
+
+```
+
+## 10.6、回退消息回执
+
+> 当 Producer 成功发送消息到 RabbitMQ Broker 时，但是在通过 Exchange 进行**匹配不到** Queue 时，Broker 会将该消息回退给 Producer 。
+
+基于异步 Confirm 模式项目改造。
+
+### 10.6.1、回退消息回执类
+
+创建 [RabbitProducerReturnCallback](https://github.com/YunaiV/SpringBoot-Labs/blob/master/lab-04/lab-04-rabbitmq-demo-confirm-async/src/main/java/cn/iocoder/springboot/lab04/rabbitmqdemo/core/RabbitProducerReturnCallback.java) 类，实现 [RabbitTemplate.ReturnCallback](https://github.com/spring-projects/spring-amqp/blob/master/spring-rabbit/src/main/java/org/springframework/amqp/rabbit/core/RabbitTemplate.java#L2712-L2727) 接口，提供 Producer 收到 RabbitMQ Broker 回退消息的的回调。代码如下：
+
+```java
+@Log4j2
+@Component
+public class RabbitProducerReturnCallback implements RabbitTemplate.ReturnCallback {
+
+    /**
+     * 消息通过 exchange 路由到 queue 时，没有找到对应的queue时回执的方法
+     * @title returnedMessage
+     * @author Jjcc
+     * @param message 返回的消息体
+     * @param replyCode 回复代码
+     * @param replyText 回复文本
+     * @param exchange 交换机name
+     * @param routingKey 路由key
+     * @createTime 2020/3/17 12:44
+     */
+    @Override
+    public void returnedMessage(Message message, int replyCode, String replyText, String exchange, String routingKey) {
+        System.out.println("1111111111");
+        log.info("[returnedMessage][message: [{}] replyCode: [{}] replyText: [{}] exchange: [{}] routingKey: [{}]]",
+                message, replyCode, replyText, exchange, routingKey);
+    }
+}
+```
+
+- 在 `#returnedMessage(...)` 方法中，打印错误日志。当然，具体怎么处理，可以根据自己的需要。
+
+**将定义好的`ReturnCallback`设置到`RabbitTemplate`中**
+
+```java
+/**
+ * 生产者的回调都在这里
+ * @title rabbitTemplate
+ * @author Jjcc
+ * @param rabbitTemplate rabbit模板类
+ * @param producerConfirmCallback 生产者的确认发送回调
+ * @param producerReturnCallback 生产者的消息发送路由不到 queue 回调
+ * @return org.springframework.amqp.rabbit.core.RabbitTemplate
+ * @createTime 2020/3/18 14:08
+ */
+ @Autowired
+ public RabbitTemplate rabbitTemplate(RabbitTemplate rabbitTemplate, RabbitProducerConfirmCallback producerConfirmCallback,
+                                      RabbitProducerReturnCallback producerReturnCallback){
+     //消息发送失败后返回到队列中
+     rabbitTemplate.setMandatory(true);
+
+     rabbitTemplate.setReturnCallback(producerReturnCallback);
+     rabbitTemplate.setConfirmCallback(producerConfirmCallback);
+
+     return rabbitTemplate;
+ }
+```
+
+### 10.6.2、生产者
+
+增加一个发送无法匹配到 Queue 的消息的方法。代码如下：
+
+```java
+/**
+ * 异步 Confirm 模式，消息的发送确认不需要使用 invoke 方法
+ * 通过 rabbitTemplate 的 setConfirmCallback() 方法设置 confirm 的回执类实现
+ * @title send
+ * @author Jjcc
+ * @return void
+ * @createTime 2020/2/28 0028 17:36
+ */
+public void sendReturn(Integer id) {
+
+    rabbitTemplate.convertAndSend("exchange_concurrency1", "error.key", id);
+
+}
+```
+
+- 发送消息的 RoutingKey ，我们故意设置为 `error.key` ，达到消息无法匹配到 Queue 的效果。
+
+### 10.6.3、测试
+
+```java
+// Demo13ProducerTest.java
+
+@Test
+public void testSyncSendReturn() throws InterruptedException {
+    int id = (int) (System.currentTimeMillis() / 1000);
+    producer.syncSendReturn(id);
+    logger.info("[testSyncSendReturn][发送编号：[{}] 发送成功]", id);
+
+    // 阻塞等待，保证消费
+    new CountDownLatch(1).await();
+}
+```
+
+执行 `#testSyncSendReturn()` 单元测试，输出日志如下：
+
+```
+// 单元测试，打印下日志，可以忽略
+2019-12-13 17:40:57.130  INFO 74326 --- [           main] c.i.s.l.r.producer.Demo13ProducerTest    : [testSyncSendReturn][发送编号：[1576230057] 发送成功]
+
+// RabbitConnectionFactory 线程，Producer 确认收到 RabbitMQ Broker 对该消息的退回 。
+2019-12-13 17:41:02.817 ERROR 74326 --- [nectionFactory1] c.i.s.l.r.c.RabbitProducerReturnCallback : [returnedMessage][message: [(Body:'[B@4689be61(byte[187])' MessageProperties [headers={}, contentType=application/x-java-serialized-object, contentLength=0, receivedDeliveryMode=PERSISTENT, priority=0, deliveryTag=0])] replyCode: [312] replyText: [NO_ROUTE] exchange: [EXCHANGE_DEMO_13] routingKey: []]
+
+// RabbitConnectionFactory 线程，Producer 确认收到 RabbitMQ Broker 对该消息的成功“响应” 。
+// 注意，即使存在 RabbitMQ Broker 回退消息的情况，依然会收到对该消息的成功“响应”
+2019-12-13 17:41:02.819  INFO 74326 --- [nectionFactory1] .i.s.l.r.c.RabbitProducerConfirmCallback : [confirm][Confirm 成功 correla
+```
+
+# 11、MessageConverter
+
+在 Spring-AMQP 中，通过 [MessageConverter](https://github.com/spring-projects/spring-amqp/blob/master/spring-amqp/src/main/java/org/springframework/amqp/support/converter/MessageConverter.java) 来作为消息转换器：
+
+- 在 Producer 中，将 Java POJO 转换成 AMQP [Message](https://github.com/spring-projects/spring-amqp/blob/master/spring-amqp/src/main/java/org/springframework/amqp/core/Message.java) 。
+- 在 Consumer 中，将 AMQP [Message](https://github.com/spring-projects/spring-amqp/blob/master/spring-amqp/src/main/java/org/springframework/amqp/core/Message.java) 转换成 Java POJO 。
+
+ 默认情况下，RabbitTemplate 采用 [SimpleMessageConverter](https://github.com/spring-projects/spring-framework/blob/master/spring-messaging/src/main/java/org/springframework/messaging/converter/SimpleMessageConverter.java) 。而 `SimpleMessageConverter` 内部，采用 Java **自带**序列化方式，实现对 Java POJO 对象的序列化和反序列化，所以官方目前不是很推荐。主要缺点如下：
+
+- 无法跨语言
+- 序列化后的字节数组太大
+- 序列化性能太低
+
+因此一般情况下，我们建议采用 [Jackson2JsonMessageConverter](https://github.com/spring-projects/spring-amqp/blob/master/spring-amqp/src/main/java/org/springframework/amqp/support/converter/Jackson2JsonMessageConverter.java) ，使用 **JSON** 实现对 Java POJO 对象的序列化和反序列化。
+
+## 11.1、依赖
+
+在 [`pom.xml`](https://github.com/YunaiV/SpringBoot-Labs/tree/master/lab-04/lab-04-rabbitmq-demo-json/pom.xml) 文件中，引入相关依赖。
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.jjcc</groupId>
+        <artifactId>rabbitmq-study</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+        <relativePath/> <!-- lookup parent from repository -->
+    </parent>
+    <groupId>com.jjcc.batch</groupId>
+    <artifactId>rabbitmq-serializ-json-demo</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>rabbitmq-delayQueue-demo</name>
+    <description>Demo project for Spring Boot</description>
+
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Jackson 依赖，用于消息序列化  -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+    </dependencies>
+
+</project>
+
+```
+
+- 相对于前面的项目来说，额外引入了 `jackson-databind`依赖。
+
+## 11.2、配置文件
+
+与前文一致。
+
+## 11.3、消息类
+
+```java
+@Data
+public class MessagePoJo implements Serializable {
+
+    private Integer id;
+
+    private String name;
+
+}
+```
+
+## 11.4、配置类
+
+与前文相比，额外添加创建 `Jackson2JsonMessageConverter` Bean 。
+
+```java
+@Configuration
+public class RabbitConfig {
+
+   /**
+    * 生产者的回调都在这里
+    * @title rabbitTemplate
+    * @author Jjcc
+    * @param rabbitTemplate rabbit模板类
+    * @param producerConfirmCallback 生产者的确认发送回调
+    * @param producerReturnCallback 生产者的消息发送路由不到 queue 回调
+    * @return org.springframework.amqp.rabbit.core.RabbitTemplate
+    * @createTime 2020/3/18 14:08
+    */
+    @Autowired
+    public RabbitTemplate rabbitTemplate(RabbitTemplate rabbitTemplate, RabbitProducerConfirmCallback producerConfirmCallback,
+                                         RabbitProducerReturnCallback producerReturnCallback){
+        //消息发送失败后返回到队列中
+        rabbitTemplate.setMandatory(true);
+
+        rabbitTemplate.setReturnCallback(producerReturnCallback);
+        rabbitTemplate.setConfirmCallback(producerConfirmCallback);
+
+        return rabbitTemplate;
+    }
+
+    /**
+     * 创建 Jackson2JsonMessageConverter 对象，使用jackson序列化 java pojo对象
+     * RabbitAutoConfiguration.RabbitTemplateConfiguration 在创建 RabbitTemplate Bean 时，会自动注入它。
+     * @title messageConverter
+     * @author Jjcc
+     * @return org.springframework.amqp.support.converter.MessageConverter
+     * @createTime 2020/3/18 15:26
+     */
+    @Bean
+    public MessageConverter messageConverter() {
+        return new Jackson2JsonMessageConverter();
+    }
+
+}
+```
+
+- 在 `#messageConverter()` 方法，创建 Jackson2JsonMessageConverter Bean 对象。后续，[RabbitAutoConfiguration.RabbitTemplateConfiguration](https://github.com/spring-projects/spring-boot/blob/master/spring-boot-project/spring-boot-autoconfigure/src/main/java/org/springframework/boot/autoconfigure/amqp/RabbitAutoConfiguration.java) 在创建 RabbitTemplate Bean 时，会自动注入它。
+
+## 11.5、生产者
+
+相较于前文，没有任何改变。
+
+```java
+@Component
+@Log4j2
+public class RabbitProducer {
+
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    public RabbitProducer(RabbitTemplate rabbitTemplate) {
+        this.rabbitTemplate = rabbitTemplate;
+    }
+
+    /**
+     * 异步 Confirm 模式，消息的发送确认不需要使用 invoke 方法
+     * 通过 rabbitTemplate 的 setConfirmCallback() 方法设置 confirm 的回执类实现
+     * @title send
+     * @author Jjcc
+     * @return void
+     * @createTime 2020/2/28 0028 17:36
+     */
+    public void send(MessagePoJo messagePoJo) {
+
+        rabbitTemplate.convertAndSend("exchange_concurrency1", "concurrency.key1", messagePoJo);
+
+    }
+
+}
+```
+
+- 在序列化时，使用了 `Jackson2JsonMessageConverter` 序列化`MessagePojo`消息对象，它会在 RabbitMQ 消息 [MessageProperties](https://github.com/spring-projects/spring-amqp/blob/master/spring-amqp/src/main/java/org/springframework/amqp/core/MessageProperties.java) 的 `__TypeId__` （这只是一个 `key name`，存储在`MessageProperties`中的名为 `headers`的`hashmap`中）上，值为 Message 消息对应的**类全名**。
+
+  ```java
+  Map<String, Object> headers = new HashMap<>();
+  
+  headers={spring_listener_return_correlation=1e849e9c-3399-4cc4-85ad-4e53e63bbbe0, __TypeId__=com.jjcc.batch.config.MessagePoJo}
+  ```
+
+## 11.6、消费者
+
+```java
+@Component
+@Log4j2
+public class RabbitConsumer {
+
+
+    /**
+     * 默认情况下,如果没有配置手动ACK, 那么Spring Data AMQP 会在消息消费完毕后自动帮我们去ACK
+     * 存在问题：如果报错了,消息不会丢失,但是会无限循环消费,一直报错,如果开启了错误日志很容易就吧磁盘空间耗完
+     * @title ackReceiver
+     * @author Jjcc
+     * @param channel 信道
+     * @param message 消息传递的参数
+     * @return void
+     * @createTime 2020/3/15 22:52
+     */
+    @RabbitListener(bindings = {
+            @QueueBinding(value = @Queue(value = "queue_concurrency1", durable = "true", autoDelete = "false", exclusive = "false")
+                    , exchange = @Exchange(name = "exchange_concurrency1", autoDelete = "true")
+                    , key = "concurrency.key1")})
+    public void ackReceiver(Channel channel, Message message) throws IOException {
+        // 通知 broker 消息已接收，可以 ACK(从队列中删除) 了
+        // 第二个参数 multiple ，用于批量确认消息，为了减少网络流量，手动确认可以被批处。
+        // 1. 当 multiple 为 true 时，则可以一次性确认 deliveryTag 小于等于传入值的所有消息
+        // 2. 当 multiple 为 false 时，则只确认当前 deliveryTag 对应的消息
+        channel.basicAck(message.getMessageProperties().getDeliveryTag(), false);
+
+        try {
+            byte[] body = message.getBody();
+            String s = new String(body);
+            log.info("[消息接收者：{}][消息主题：{}]", Thread.currentThread().getId(), s);
+
+            String type = message.getMessageProperties().getType();
+            String contentType = message.getMessageProperties().getContentType();
+            String s1 = message.getMessageProperties().toString();
+
+            log.info("[type：{}][contentType：{}]]", type, contentType);
+
+            log.info("[MessageProperties：{}]", s1);
+
+        } catch (Exception e) {
+            /*
+             * basicRecover方法是进行补发操作；
+             * 参数为true，是把消息退回到queue，但是有可能被其它的consumer(集群)接收到。
+             * 参数为false，把消息退回到queue，只补发给当前的consumer。
+             */
+            channel.basicRecover(false);
+
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+- 在反序列化时，我们使用了 `Jackson2JsonMessageConverter` 序列化出 Message 消息对象，它会根据 RabbitMQ 消息 [MessageProperties](https://github.com/spring-projects/spring-amqp/blob/master/spring-amqp/src/main/java/org/springframework/amqp/core/MessageProperties.java) 的 `__TypeId__` 的值，反序列化消息内容成该 Message 对象。
+- 因为我们希望通过查看具体消息内容，判断是不是真的使用 JSON 格式，所以采用 AMQP Message 接收消息。
+
+## 11.7、测试
+
+```java
+@SpringBootTest(classes = RabbitmqBatchDemoApplication.class)
+@RunWith(SpringRunner.class)
+public class RabbitmqBatchDemoApplicationTests {
+
+    @Autowired
+    private RabbitProducer producer;
+
+
+    @Test
+    public void contextLoadsB() throws InterruptedException {
+        MessagePoJo messagePoJo = new MessagePoJo();
+        for (int i = 0; i < 1; i++) {
+            messagePoJo.setId(i);
+            messagePoJo.setName("Jjcc---" + i);
+            sendDelay(messagePoJo);
+        }
+        System.out.println("消息发送完成！！！！！！！！！");
+        new CountDownLatch(1).await();
+    }
+
+
+    public void sendDelay(MessagePoJo para) {
+        producer.send(para);
+
+    }
+
+}
+```
+
+执行方法后，控制台输出打印：
+
+```
+消息发送完成！！！！！！！！！
+2020-03-18 16:43:15.396  INFO 7896 --- [nectionFactory1] c.j.b.c.RabbitProducerConfirmCallback    : [confirm][Confirm 成功 correlationData: null]
+2020-03-18 16:43:15.418  INFO 7896 --- [ntContainer#1-1] 
+
+com.jjcc.batch.consumer.RabbitConsumer   : [消息接收者：19][消息主题：{"id":0,"name":"Jjcc---0"}]
+
+2020-03-18 16:43:15.419  INFO 7896 --- [ntContainer#1-1] com.jjcc.batch.consumer.RabbitConsumer   : [type：null][contentType：application/json]]
+
+// 打印 MessageProperties；__TypeId__=com.jjcc.batch.config.MessagePoJo
+2020-03-18 16:43:15.419  INFO 7896 --- [ntContainer#1-1] com.jjcc.batch.consumer.RabbitConsumer   : [MessageProperties：MessageProperties [headers={spring_listener_return_correlation=f73aaa3e-10c2-408e-aeaa-f27a24b7bdc0, __TypeId__=com.jjcc.batch.config.MessagePoJo}, contentType=application/json, contentEncoding=UTF-8, contentLength=0, receivedDeliveryMode=PERSISTENT, priority=0, redelivered=false, receivedExchange=exchange_concurrency1, receivedRoutingKey=concurrency.key1, deliveryTag=1, consumerTag=amq.ctag-vQByFS3YSLGq_VfBvVNzGA, consumerQueue=queue_concurrency1]]
+
+```
+
+# 12、消费异常处理器
+
+http://www.iocoder.cn/Spring-Boot/RabbitMQ/ 17. 消费异常处理器
 
 
 
@@ -3404,3 +4849,4 @@ public class RabbitmqBatchDemoApplicationTests {
 
 
 ​		
+
